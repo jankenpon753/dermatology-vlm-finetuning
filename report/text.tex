@@ -1,0 +1,298 @@
+\documentclass[12pt, a4paper]{article}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{cite}
+\geometry{margin=1in}
+
+\title{\textbf{Project Report: Parameter-Efficient Fine-Tuning of Multimodal Models for Dermatology Classification}}
+\author{
+    \textbf{Md. Tajim An Noor} (Team Lead) \\
+    \textbf{[Team Member 2 Name]} \\
+    \textbf{[Team Member 3 Name]} \\
+    \textit{Department of Electrical \& Computer Engineering} \\
+    \textit{Rajshahi University of Engineering \& Technology (RUET)}
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\newpage
+
+\tableofcontents
+\newpage
+
+\section{Abstract}
+This project addresses the critical challenge of automated skin disease classification within edge computing and resource-constrained environments. We implemented a unified machine learning solution utilizing the Gemma 3N 4B multimodal transformer model, fine-tuned on the ``derm-reasoning'' dataset. To effectively adapt the model for instruction-following visual and textual inputs without incurring massive computational overhead, we employed Low-Rank Adaptation (LoRA) accelerated by the Unsloth framework. This parameter-efficient strategy allowed us to train a mere 19,210,240 parameters, representing just 0.24\% of the model's 7.8 billion total parameters \cite{gemma_3n_2025}. Operating on a single NVIDIA Tesla T4 GPU, the optimized model achieved an overall accuracy of 85.4\% and an F1-score of 0.849. This report details the system design, algorithmic trade-offs, and experimental validation, demonstrating that advanced vision-language projection layers can yield robust diagnostic performance while strictly adhering to hardware memory limitations, paving the way for scalable point-of-care clinical applications.
+
+\section{Introduction}
+The accurate and timely diagnosis of dermatological conditions remains a significant hurdle in global healthcare, often hindered by the subjective nature of visual inspections and a shortage of specialized practitioners. The global burden of skin disease is immense, affecting nearly one-third of the global population and causing significant disability \cite{hay2014global}. Misdiagnosis in primary care settings is common, leading to delayed treatment, increased healthcare costs, and psychological distress for patients.
+
+With the rapid evolution of Artificial Intelligence (AI), specifically multimodal Large Language Models (LLMs), there is a compelling motivation to apply these frameworks to clinical diagnostics to alleviate these challenges \cite{moor2023foundation}. The core problem addressed in this project is the deployment of highly accurate, integrated AI diagnostic systems on standard consumer or edge hardware. Traditional full-parameter fine-tuning of multi-billion parameter models is computationally prohibitive, requiring extensive GPU clusters that are not readily available in local clinics or developing regions.
+
+By investigating the Matryoshka Transformer (MatFormer) architecture \cite{kusupati2022matryoshka} of the Gemma 3N 4B model—which utilizes Per-Layer Embedding (PLE) caching and selective parameter activation—we present a highly scalable solution. This report documents our systematic investigation, highlighting the methodology, conflicting requirements encountered, and the successful execution of our proposed machine learning pipeline. Our work demonstrates the potential of parameter-efficient fine-tuning (PEFT) techniques to democratize access to advanced AI-driven diagnostic tools.
+
+\section{Problem Definition}
+The fundamental task is a supervised multimodal classification problem. Given a dataset $\mathcal{D} = \{(x_i^{(v)}, x_i^{(t)}, y_i)\}_{i=1}^N$, where $x_i^{(v)}$ is a visual input (dermatological image), $x_i^{(t)}$ is a textual prompt (dialogue context), and $y_i \in \mathcal{C}$ is the categorical label representing the skin disease, our goal is to learn a mapping function $f_\theta: (X^{(v)}, X^{(t)}) \rightarrow Y$. This function must be robust enough to handle the inherent variability in clinical data—such as differences in lighting, skin phenotypes, and focal lengths—and provide accurate predictions to assist healthcare professionals.
+
+\subsection{Dataset Characteristics}
+The dataset utilized is the Huggingface \texttt{danielfdias98/derm-reasoning} collection \cite{dias2026derm-reasoning}, a comprehensive aggregation designed for multimodal reasoning tasks.
+\begin{itemize}
+  \item \textbf{Total Samples:} 5,086 rows. Each row corresponds to a unique clinical case.
+  \item \textbf{Image Dimensions:} The images are standardized to $720 \times 489$ pixels for consistency. The model's vision encoder processes these at a resolution of up to $512 \times 512$, balancing computational load with feature retention.
+  \item \textbf{Class Distribution:} The dataset contains 25 distinct skin disease classes, including Psoriasis, Tinea, Eczema, Squamous cell carcinoma, and Basal cell carcinoma.
+  \item \textbf{Data Split:} The dataset is strictly partitioned into training (4,069 samples, 80\%), validation (509 samples, 10\%), and testing (508 samples, 10\%) sets to prevent data leakage.
+\end{itemize}
+
+A primary constraint is managing a multi-class imbalanced dataset \cite{buda2018systematic}. We analyzed the distribution of samples across the 25 distinct skin disease classes, visually represented in Figure \ref{fig:class_dist}. As anticipated, the dataset exhibits noticeable class imbalance, which informed our model evaluation strategies, leading us to prioritize macro F1-scores over simple accuracy.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\textwidth]{class-dist.png}
+  \caption{Visual representation of the class distribution across the 25 distinct skin disease classes in the 'derm-reasoning' dataset.}
+  \label{fig:class_dist}
+\end{figure}
+
+\section{Investigation \& Requirements Analysis (PO4)}
+\subsection{Identification of the Core ML Challenge}
+The primary machine learning challenge is synthesizing features from two distinct modalities (visual and textual) to perform high-fidelity multi-class classification. While traditional Convolutional Neural Networks (CNNs) have demonstrated strong performance in standalone image classification, they lack the native capacity for complex textual reasoning \cite{moor2023foundation}. This is a critical limitation in clinical diagnostics, where patient history and dialogue are paramount. Multimodal transformers integrate these sources but introduce massive memory overheads.
+
+\subsection{Conflicting Requirements (P2)}
+During the investigation phase, we identified several conflicting constraints that required structural trade-offs:
+\begin{enumerate}
+  \item \textbf{Accuracy vs. Complexity:} Maximizing diagnostic accuracy demands larger, more complex models (e.g., 8B+ parameters). However, our hardware was limited to a single NVIDIA Tesla T4 GPU with 14.7 GB of VRAM, which is grossly insufficient for full fine-tuning.
+  \item \textbf{Training Time vs. Generalization:} Extensive training epochs improve generalization but exceed practical sessional time constraints.
+  \item \textbf{Inference Speed vs. Model Size:} Larger models exhibit higher inference latency, violating the requirement for timely clinical tool responses.
+\end{enumerate}
+
+To resolve these conflicts, we implemented 4-bit quantization (QLoRA) \cite{dettmers2023qlora} combined with Low-Rank Adaptation \cite{hu2021lora} via the Unsloth framework. This satisfied the requirement for deep analytical capacity (P1) while remaining well within the strict bounds of our hardware ecosystem.
+
+\section{Methodology / System Design (CO3)}
+
+\subsection{Choice of Machine Learning Techniques}
+We selected the Gemma 3N 4B MatFormer architecture. The model features a language decoder tightly integrated with a MobileNet-V5 vision encoder \cite{howard2019searching}.
+
+To facilitate training without catastrophic memory allocation, we utilized LoRA. In standard fine-tuning, the pre-trained weight matrix $W_0 \in \mathbb{R}^{d \times k}$ receives a full rank update $\Delta W$. LoRA constrains this update by representing it as the product of two low-rank matrices, $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$, where the rank $r \ll \min(d, k)$. The forward pass is modified as:
+\begin{equation}
+  h = W_0 x + \Delta W x = W_0 x + B A x
+\end{equation}
+By setting $r=8$ and scaling factor $\alpha=8$, we applied these adapters specifically to the attention modules, feed-forward layers, and vision-language projection layers. Audio components remained frozen.
+
+\subsection{System Architecture}
+\begin{figure}[H]
+  \centering
+  % \includegraphics[width=0.9\textwidth]{architecture_diagram.png}
+  \caption{Proposed Multimodal System Architecture Pipeline.}
+  \label{fig:architecture}
+\end{figure}
+
+Table \ref{tab:params} outlines the efficiency of our chosen architecture setup.
+
+\begin{table}[H]
+  \centering
+  \caption{Model Parameter Distribution}
+  \label{tab:params}
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Component}    & \textbf{Details}              \\
+    \midrule
+    Effective Parameters  & $\sim$4B (E4B)                \\
+    Actual Parameters     & $\sim$8B total                \\
+    With PLE              & $\sim$6.8B+ active at runtime \\
+    Trainable (Our Setup) & $\sim$19M (LoRA, 0.24\%)      \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Algorithm Steps}
+\begin{algorithm}[H]
+  \caption{Multimodal PEFT Training Pipeline}\label{alg:peft}
+  \begin{algorithmic}[1]
+    \State \textbf{Input:} Dataset $\mathcal{D}$, Pre-trained Model $M$, LoRA Rank $r$
+    \State $\mathcal{D}_{train}, \mathcal{D}_{val}, \mathcal{D}_{test} \gets \text{Split}(\mathcal{D}, 0.8, 0.1, 0.1)$
+    \State $M_{4bit} \gets \text{Quantize}(M, \text{bits}=4)$
+    \State $M_{LoRA} \gets \text{InjectAdapters}(M_{4bit}, \text{target\_modules}, r=8, \alpha=8)$
+    \State Optimizer $\gets \text{AdamW\_8bit}(\text{lr}=2\times10^{-4}, \text{weight\_decay}=0.01)$
+    \For{step $= 1$ to $60$}
+    \State Batch $(x^{(v)}, x^{(t)}, y) \gets \text{Sample}(\mathcal{D}_{train}, \text{batch\_size}=8)$
+    \State $\hat{y} \gets M_{LoRA}(x^{(v)}, x^{(t)})$
+    \State Loss $\gets \text{CrossEntropy}(\hat{y}, y)$
+    \State Loss.backward()
+    \State Optimizer.step()
+    \EndFor
+    \State \textbf{Output:} Fine-tuned model $M^*_{LoRA}$
+  \end{algorithmic}
+\end{algorithm}
+
+\section{Implementation Details}
+\subsection{Programming Environment}
+The implementation was developed in Python using a Kaggle cloud environment. Key dependencies included PyTorch, Hugging Face Transformers, TRL, \texttt{bitsandbytes} for quantization \cite{dettmers2023qlora}, and \texttt{Unsloth} for memory-optimized fine-tuning.
+
+\subsection{Team Roles \& Coordination (PO9)}
+Responsibilities were divided among three team members:
+\begin{itemize}
+  \item \textbf{Md. Tajim An Noor (Lead / System Architecture):} Defined the core machine learning strategy, implemented LoRA injections via Unsloth, managed 4-bit quantization, and resolved VRAM constraints.
+  \item \textbf{[Team Member 2 Name] (Data Pipeline \& Preprocessing):} Standardized multi-turn conversational structures, processed $512 \times 512$ visual inputs, and ensured stratified dataset splitting.
+  \item \textbf{[Team Member 3 Name] (Evaluation \& Web Deployment):} Executed evaluation loops, computed metrics (F1, Confusion Matrices), tracked loss curves, and developed the prototype Gradio/Web interface.
+\end{itemize}
+
+\section{Experimental Setup (PO4)}
+The experimental framework maximized throughput on a constrained hardware profile. We carefully monitored the training loss to ensure convergence within limits, illustrated in Figure \ref{fig:loss}. The loop ran for a maximum of 60 steps, empirically providing sufficient convergence within a 16.3-minute window.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.7\textwidth]{loss-curve.png}
+  \caption{Training loss curve showing model convergence over the 60 steps.}
+  \label{fig:loss}
+\end{figure}
+
+\begin{table}[H]
+  \centering
+  \caption{Hardware \& Hyperparameter Configuration}
+  \label{tab:hyperparams}
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Parameter}          & \textbf{Value}                                  \\
+    \midrule
+    Hardware                    & Single NVIDIA Tesla T4 (Data Parallel GPUs = 1) \\
+    Total VRAM                  & $\sim$14.7 GB                                   \\
+    Optimization Framework      & Unsloth                                         \\
+    Epochs                      & 1                                               \\
+    Total Steps                 & 60                                              \\
+    Batch Size Per Device       & 2                                               \\
+    Gradient Accumulation Steps & 4                                               \\
+    Effective Batch Size        & 8                                               \\
+    Learning Rate               & $2 \times 10^{-4}$                              \\
+    Random Seed                 & 42                                              \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Results \& Performance Analysis (P3)}
+\subsection{Numerical Results}
+The model was evaluated against the reserved 508 testing samples. It achieved strong overall predictive capabilities, visualized in Figure \ref{fig:overall_score}:
+\begin{itemize}
+  \item \textbf{Accuracy:} 0.854
+  \item \textbf{Precision:} 0.850
+  \item \textbf{Recall:} 0.852
+  \item \textbf{F1-score:} 0.849
+\end{itemize}
+
+Starting at a high cross-entropy loss of roughly 7.5, the loss plummeted sharply by step 20 and stabilized around 1.5 by step 60.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.7\textwidth]{overall_score.png}
+  \caption{Overall classification performance scores (Accuracy, Precision, Recall, F1-score) for the dermatology classification task.}
+  \label{fig:overall_score}
+\end{figure}
+
+Detailed per-class F1 analysis (Figure \ref{fig:per_class_f1}) confirms strong results for prevalent conditions, with F1 scores exceeding 0.90 for Psoriasis and Squamous cell carcinoma. Consistent with visual dermatology challenges, misclassifications occurred between morphologically similar lesions (e.g., Atopic dermatitis vs. Eczema), as depicted in the confusion matrix (Figure \ref{fig:confusion_matrix}).
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\textwidth]{Per_Class_Result.png}
+  \caption{Detailed per-class F1 scores across the 25 distinct skin disease classes, highlighting varying model performance.}
+  \label{fig:per_class_f1}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\textwidth]{confusion-mat.png}
+  \caption{Detailed confusion matrix showing the distribution of true vs. predicted classifications across all 25 disease classes.}
+  \label{fig:confusion_matrix}
+\end{figure}
+
+\subsection{Complexity Analysis (P3)}
+A traditional full-parameter update of an 8B model requires gradients and optimizer states for every parameter, consuming over 40GB of VRAM ($O(N)$ memory complexity). By utilizing Unsloth, 4-bit quantization, and LoRA, our memory footprint was drastically reduced:
+\begin{itemize}
+  \item \textbf{Trainable Parameters:} 19,210,240 out of 7,869,188,432 (0.24\%)
+  \item \textbf{Peak Memory Usage:} $\sim$12.59 GB (85.4\% of T4 capacity)
+  \item \textbf{Training Time:} Completed in $\sim$16.3 minutes
+\end{itemize}
+
+\section{System Deployment \& Prototype Interface}
+To demonstrate practical utility, we deployed a prototype web interface titled \textbf{AI Doctor — Medical image analysis}. Users can upload medical images, input clinical questions, and receive structured reasoning.
+
+\subsection{Sample 1: Dermatological Diagnosis (Acne)}
+Queried with an image of inflammatory facial lesions and the prompt ``what is this?'', the model correctly identifies acne, details visual features, and provides a multi-step recommendation plan (Figure \ref{fig:webapp_sample1}).
+
+\begin{figure}[H]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{ai_doc1_0.jpg}
+    \caption*{a) User Interface \& Upload}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{ai_doc1_1.jpg}
+    \caption*{b) Model Output \& Recommendations}
+  \end{minipage}
+  \caption{Web application interface demonstrating the upload and analysis of an acne sample.}
+  \label{fig:webapp_sample1}
+\end{figure}
+
+\subsection{Sample 2: Out-of-Domain Generalization (X-Ray)}
+Testing zero-shot reasoning on out-of-domain imaging, the model successfully identifies a tibial shaft fracture from an X-ray and accurately describes clinical implications (Figure \ref{fig:webapp_sample2}), proving architectural robustness.
+
+\begin{figure}[H]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{ai_doc2_0.jpg}
+    \caption*{a) X-Ray Input}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{ai_doc2_1.jpg}
+    \caption*{b) Fracture Diagnosis \& Prognosis}
+  \end{minipage}
+  \caption{Demonstration of the model's generalized reasoning on a non-dermatological X-ray sample.}
+  \label{fig:webapp_sample2}
+\end{figure}
+
+\subsection{Sample 3: Clinical Findings \& Confidence Scoring (Eczema)}
+Evaluating dry, cracked hands with the prompt ``Describe the findings'', the model identifies superficial cracks and accurately outputs a final prediction of Eczema with a 79.5\% confidence score (Figure \ref{fig:webapp_sample3}).
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.6\textwidth]{ai_doc3_0.jpeg}\\
+  \vspace{0.3cm}
+  \includegraphics[width=0.75\textwidth]{ai_doc3_2.jpeg}\\
+  \vspace{0.3cm}
+  \includegraphics[width=0.75\textwidth]{ai_doc3_3.jpeg}
+  \caption{Top to Bottom: Input interface, clinical observations, and explicit classification (Eczema, 79.5\% confidence).}
+  \label{fig:webapp_sample3}
+\end{figure}
+
+\section{Discussion}
+The integration of LoRA enabled high-fidelity adaptation of the Gemma 3N vision-language layers. The model successfully recognized complex diagnostic patterns despite the visual input resolution being capped at $512 \times 512$.
+
+\textbf{Limitations:} Misclassifications (Figure \ref{fig:confusion_matrix}) primarily stem from morphological similarities between specific skin lesions—a known constraint in visual dermatology lacking tactile or histological data. For instance, Atopic dermatitis and Eczema share distinct erythematous features, contributing to overlapping confusion matrices.
+
+\textbf{Effectiveness under constraints:} The resolution of conflicting requirements (P2) was highly successful. By trading the mathematical purity of a full-weight update for a low-rank approximation, we bypassed severe hardware limits, achieving an 85.4\% accuracy in just 16.3 minutes of training.
+
+\section{Conclusion}
+This project successfully designed and deployed an integrated multimodal system for dermatology classification. By systematically investigating parameter-efficient fine-tuning techniques (Unsloth, LoRA, and QLoRA) on the Gemma 3N 4B architecture, our team developed a model that accurately classifies 25 skin diseases with an F1-score of 0.849. The project validates that advanced LLM diagnostic reasoning can be effectively optimized for resource-constrained environments without compromising clinical efficacy.
+
+\section{Future Work}
+Future enhancements could include:
+\begin{itemize}
+  \item \textbf{Modality Expansion:} Unfreezing audio modality encoders to support real-time dictation queries.
+  \item \textbf{Data Augmentation:} Expanding the dataset beyond 5,086 rows using generative diffusion models to address class imbalances.
+\end{itemize}
+
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+\end{document}
